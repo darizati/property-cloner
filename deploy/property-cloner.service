@@ -1,0 +1,26 @@
+[Unit]
+Description=Property Cloner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=property-cloner
+Group=property-cloner
+WorkingDirectory=/opt/property-cloner/backend
+EnvironmentFile=/etc/property-cloner/property-cloner.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/property-cloner/backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8088 --workers 1
+Restart=on-failure
+RestartSec=5
+StateDirectory=property-cloner
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/property-cloner
+
+[Install]
+WantedBy=multi-user.target
