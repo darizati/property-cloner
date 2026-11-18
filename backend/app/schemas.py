@@ -1,4 +1,5 @@
 """Pydantic request/response schemas for the API layer."""
+import datetime
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel
@@ -99,6 +100,8 @@ class CloneJobOut(BaseModel):
     log: str
     error_summary: Optional[str]
     change_summary: Optional[dict[str, Any]] = None
+    started_at: Optional[datetime.datetime] = None
+    finished_at: Optional[datetime.datetime] = None
 
     model_config = {"from_attributes": True}
 

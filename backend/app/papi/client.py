@@ -60,13 +60,25 @@ class PapiClient:
             detail = payload.get("detail") if isinstance(payload, dict) else None
             request_id = payload.get("requestId") if isinstance(payload, dict) else None
             request_time = payload.get("requestTime") if isinstance(payload, dict) else None
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            validation_details = []
+            if isinstance(errors, list):
+                for error in errors:
+                    if not isinstance(error, dict):
+                        continue
+                    location = error.get("errorLocation") or error.get("instance")
+                    message = error.get("detail") or error.get("title")
+                    if isinstance(message, str):
+                        prefix = f"{location}: " if isinstance(location, str) and location else ""
+                        validation_details.append(f"{prefix}{message}")
             correlation = ""
             if request_id or request_time:
                 correlation = f" [requestId={request_id or 'unknown'}, requestTime={request_time or 'unknown'}]"
             raise PapiError(
                 f"PAPI {resp.request.method} {resp.request.url} -> {resp.status_code}"
                 + (f": {detail}" if detail else "")
-                + correlation,
+                + correlation
+                + (("\n" + "\n".join(validation_details)) if validation_details else ""),
                 resp.status_code,
                 payload,
             )

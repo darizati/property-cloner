@@ -540,6 +540,94 @@ class CloneDraftTests(unittest.TestCase):
             self.assertEqual(CloneJobOut.model_validate(loaded).change_summary["state"], "saved")
         engine.dispose()
 
+    def test_rule_upload_failure_reports_incomplete_draft_and_validation_details(self):
+        prod, sqa, job, profile = self.existing_clone()
+        response = MagicMock(status_code=400)
+        response.request.method = "PUT"
+        response.request.url = "https://example.test/papi/rules"
+        response.json.return_value = {
+            "detail": "Your input has a syntax problem.",
+            "errors": [{"errorLocation": "#/rules/behaviors/0", "detail": "Invalid option"}],
+        }
+        client = PapiClient.__new__(PapiClient)
+        try:
+            client._check(response)
+        except PapiError as error:
+            sqa.upload_rule_tree.side_effect = error
+
+        with self.assertRaises(PapiError) as raised:
+            self.run_clone(prod, sqa, job, profile)
+
+        message = str(raised.exception)
+        self.assertIn("version 21", message)
+        self.assertIn("incomplete", message)
+        self.assertIn("#/rules/behaviors/0", message)
+        self.assertIn("Invalid option", message)
+        self.assertEqual(job.change_summary["state"], "planned")
+        sqa.activate.assert_not_called()
+
+    def test_upload_schema_error_identifies_actual_feature_and_expected_type(self):
+        prod, sqa, job, profile = self.existing_clone()
+        prod.get_rule_tree.return_value = {"rules": {"name": "default", "behaviors": [
+            {"name": "cacheRedirect", "options": {"enabled": "false"}},
+        ]}}
+        location = "/rules/behaviors/0/options/enabled"
+        issue = {
+            "location": location,
+            "schemaLocation": "/definitions/catalog/behaviors/cacheRedirect/properties/options/properties/enabled",
+            "detail": "does not have a value in the enumeration [false, true]",
+            "foundValue": "false", "allowedValues": [False, True],
+        }
+        unrelated = {
+            **issue, "schemaLocation": "/definitions/catalog/behaviors/other/properties/options/properties/enabled",
+        }
+        payload = {"detail": "Schema error", "errors": [unrelated, issue, issue]}
+        sqa.upload_rule_tree.side_effect = PapiError("generic API error", 400, payload)
+
+        with self.assertRaises(PapiError) as raised:
+            self.run_clone(prod, sqa, job, profile)
+
+        message = str(raised.exception)
+        self.assertIn('cacheRedirect.enabled: received string "false"; expected boolean [false, true]', message)
+        self.assertIn(location, message)
+        self.assertIn("fixed override", message)
+        self.assertEqual(message.count("cacheRedirect.enabled:"), 1)
+        self.assertNotIn("other.enabled", message)
+        self.assertEqual(sqa.upload_rule_tree.call_args.args[-1]["rules"]["behaviors"][0]["options"]["enabled"], "false")
+        sqa.activate.assert_not_called()
+
+    def test_schema_errors_without_identifiable_feature_fall_back_to_papi_message(self):
+        prod, sqa, job, profile = self.existing_clone()
+        sqa.upload_rule_tree.side_effect = PapiError(
+            "Schema rejected by PAPI", 400, {"detail": "Rejected", "errors": [{"detail": "Unknown"}]},
+        )
+        with self.assertRaises(PapiError) as raised:
+            self.run_clone(prod, sqa, job, profile)
+        self.assertIn("Schema rejected by PAPI", str(raised.exception))
+
+    def test_papi_job_failure_is_recorded_without_python_traceback(self):
+        job = SimpleNamespace(id=1, profile=SimpleNamespace(name="test"), log="")
+        session = MagicMock()
+        session.get.return_value = job
+        with patch.object(clone_service, "SessionLocal", return_value=session), \
+             patch.object(clone_service, "_run_clone", side_effect=PapiError("Upload rejected", 400)), \
+             patch.object(clone_service, "notify_job_outcome"):
+            clone_service.execute_job(job.id)
+        self.assertEqual(job.status, models.JobStatus.FAILED)
+        self.assertEqual(job.error_summary, "Upload rejected")
+        self.assertIn("Upload rejected", job.log)
+        self.assertNotIn("Traceback", job.log)
+
+    def test_unexpected_job_failure_keeps_python_traceback(self):
+        job = SimpleNamespace(id=1, profile=SimpleNamespace(name="test"), log="")
+        session = MagicMock()
+        session.get.return_value = job
+        with patch.object(clone_service, "SessionLocal", return_value=session), \
+             patch.object(clone_service, "_run_clone", side_effect=RuntimeError("Unexpected")), \
+             patch.object(clone_service, "notify_job_outcome"):
+            clone_service.execute_job(job.id)
+        self.assertIn("Traceback", job.log)
+
     def test_scheduled_lookup_failure_is_recorded_and_notified(self):
         prod, _, _, profile = self.existing_clone()
         profile.id = 1
@@ -556,6 +644,7 @@ class CloneDraftTests(unittest.TestCase):
         self.assertEqual(job.trigger, "scheduled")
         self.assertEqual(job.error_summary, "Lookup unavailable")
         self.assertIn("Lookup unavailable", job.log)
+        self.assertNotIn("Traceback", job.log)
         self.assertEqual(job.change_summary["context"]["schedule_cron"], profile.schedule_cron)
 
     def test_scheduled_checks_record_skip_reasons_without_uploads(self):
@@ -969,6 +1058,35 @@ class PropertyLookupTests(unittest.TestCase):
         result = self.client.activate("prp_30", 21, "test", "40", "key", "PRODUCTION", [])
         self.assertEqual(result.status, "FAILED")
         self.assertEqual(result.errors, [{"detail": "Invalid rule configuration"}])
+
+    def test_api_error_handles_missing_and_malformed_validation_details(self):
+        response = MagicMock(status_code=400)
+        response.request.method = "PUT"
+        response.request.url = "https://example.test/papi/rules"
+        for errors in (None, "invalid", [None, {}, {"detail": 42}]):
+            with self.subTest(errors=errors):
+                response.json.return_value = {"detail": "Rejected", "errors": errors}
+                with self.assertRaises(PapiError) as raised:
+                    self.client._check(response)
+                self.assertEqual(str(raised.exception), "PAPI PUT https://example.test/papi/rules -> 400: Rejected")
+                self.assertEqual(raised.exception.status_code, 400)
+
+    def test_api_error_includes_multiple_validation_locations(self):
+        response = MagicMock(status_code=400)
+        response.request.method = "PUT"
+        response.request.url = "https://example.test/papi/rules"
+        response.json.return_value = {
+            "detail": "Rejected", "requestId": "request-1",
+            "errors": [
+                {"errorLocation": "#/rules", "detail": "Invalid rule"},
+                {"instance": "#/rules/behaviors/0", "title": "Invalid behavior"},
+            ],
+        }
+        with self.assertRaises(PapiError) as raised:
+            self.client._check(response)
+        self.assertIn("requestId=request-1", str(raised.exception))
+        self.assertIn("#/rules: Invalid rule", str(raised.exception))
+        self.assertIn("#/rules/behaviors/0: Invalid behavior", str(raised.exception))
 
     def test_duplicate_name_has_actionable_error_without_retry(self):
         self.client._post.side_effect = PapiError(

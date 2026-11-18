@@ -114,6 +114,10 @@ Keep its port on the trusted lab network; do not expose it to the public Interne
    creates a brand-new SQA property (first clone), updates the latest editable draft,
    or creates a new version when the latest version has already been activated.
    The configured policies and fixed overrides are applied before uploading rules.
+   If PAPI rejects the upload, the job reports any returned validation details.
+   When PAPI identifies an option's expected values, the job identifies the
+   feature, location, and expected type so you can select an SQA value or set an override.
+   A property or version may already have been created; review it before retrying.
 4. **Activation**: when **Attempt activation** is checked, existing properties with
    hostnames on the target version and successful activation history are activated
    after saving. Unchecked runs only save a draft. The target network is

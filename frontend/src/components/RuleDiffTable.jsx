@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Badge, Button, Form, Table } from "react-bootstrap";
-import { ChevronRight, ChevronsDownUp, ChevronsUpDown, Code2, Plus, Trash2 } from "lucide-react";
+import { ChevronRight, ChevronsDownUp, ChevronsUpDown, Code2, Plus, Search, Trash2 } from "lucide-react";
 
 const EMPTY = {};
 
@@ -54,9 +54,20 @@ function visibleWhitespace(value) {
   return value.replace(/ /g, "\u00b7").replace(/\t/g, "\\t").replace(/\r/g, "\\r").replace(/\n/g, "\\n\n");
 }
 
+function nodeMatches(node, query, changedOnly) {
+  if (changedOnly && changedFields(node).length === 0 && node.in_prod && node.in_sqa) return false;
+  if (!query) return true;
+  return [node.name, node.kind, node.rule_path].some((text) => text?.toLowerCase().includes(query));
+}
+
 export default function RuleDiffTable({ nodes, policies, onPolicyChange, onSubsectionPolicyChange, overrides, onOverrideChange, onPendingChange }) {
   const [closedGroups, setClosedGroups] = useState(new Set());
   const [expandedItems, setExpandedItems] = useState(new Set());
+  const [search, setSearch] = useState("");
+  const [changedOnly, setChangedOnly] = useState(false);
+  const query = search.trim().toLowerCase();
+  const filtering = Boolean(query) || changedOnly;
+  const visibleNodes = new Set(nodes.filter((node) => nodeMatches(node, query, changedOnly)).map((node) => node.signature));
   const groups = new Map();
   nodes.forEach((node) => {
     const parts = node.rule_path.split("/");
@@ -78,8 +89,30 @@ export default function RuleDiffTable({ nodes, policies, onPolicyChange, onSubse
 
   return (
     <div className="rule-diff">
+      <div className="rule-diff-stats">
+        <span><strong>{groups.size}</strong> sections</span>
+        <span><strong>{nodes.length}</strong> items</span>
+        <span><strong>{nodes.filter((node) => node.kind === "variable").length}</strong> variables</span>
+        <span className="rule-diff-stat-changed"><strong>{nodes.filter((node) => changedFields(node).length > 0).length}</strong> changed</span>
+        <span><strong>{nodes.filter((node) => !node.in_prod || !node.in_sqa).length}</strong> one-sided</span>
+      </div>
       <div className="rule-diff-toolbar">
-        <span className="text-muted small">{groups.size} sections · {nodes.length} items · {nodes.filter((node) => node.kind === "variable").length} variables · {nodes.filter((node) => changedFields(node).length > 0).length} changed items</span>
+        <div className="rule-diff-filters">
+          <div className="search-input">
+            <Search size={15} aria-hidden="true" />
+            <Form.Control size="sm" type="search" placeholder="Filter rules, behaviors, variables…" aria-label="Filter rule items"
+              value={search} onChange={(event) => {
+                setSearch(event.target.value);
+                if (event.target.value.trim()) setClosedGroups(new Set());
+              }} />
+          </div>
+          <Form.Check type="switch" id="rule-diff-changed-only" label="Differences only" checked={changedOnly}
+            onChange={(event) => {
+              setChangedOnly(event.target.checked);
+              if (event.target.checked) setClosedGroups(new Set());
+            }} />
+          {filtering && <span className="text-muted small">{visibleNodes.size} of {nodes.length} shown</span>}
+        </div>
         <div className="d-flex gap-2">
           <Button size="sm" variant="outline-secondary" onClick={() => {
             setClosedGroups(new Set());
@@ -102,12 +135,17 @@ export default function RuleDiffTable({ nodes, policies, onPolicyChange, onSubse
         const displayedPolicy = sameValues && !selectedPolicies.has("remove") ? "same" : subsectionPolicy;
         const allInProd = descendants.every((node) => node.in_prod);
         const allInSqa = descendants.every((node) => node.in_sqa);
+        const segments = path.split("/");
+        const hasVisible = descendants.some((node) => visibleNodes.has(node.signature));
+        const visibleItems = items.filter((node) => visibleNodes.has(node.signature));
         return (
-          <section className="rule-group" key={path} hidden={ancestors.some((ancestor) => closedGroups.has(ancestor))}>
+          <section className={`rule-group${segments.length > 1 ? " rule-group-nested" : ""}`} key={path}
+            style={{ "--depth": segments.length - 1 }}
+            hidden={!hasVisible || ancestors.some((ancestor) => closedGroups.has(ancestor))}>
             <div className="rule-group-heading">
-            <button type="button" className="rule-group-toggle" aria-expanded={!closed} onClick={() => toggleGroup(path)}>
+            <button type="button" className="rule-group-toggle" aria-expanded={!closed} title={path} onClick={() => toggleGroup(path)}>
               <ChevronRight className={closed ? "" : "chevron-open"} size={18} aria-hidden="true" />
-              <span className="rule-section-title">{path}</span>
+              <span className="rule-section-title">{segments[segments.length - 1]}</span>
               <span className="rule-section-counts">
                 {changedCount > 0 && <Badge bg="warning" text="dark">{changedCount} changed {changedCount === 1 ? "item" : "items"}</Badge>}
                 <span>{descendants.length} {descendants.length === 1 ? "item" : "items"}</span>
@@ -122,8 +160,8 @@ export default function RuleDiffTable({ nodes, policies, onPolicyChange, onSubse
               <option value="remove">Remove subsection items</option>
             </Form.Select>
             </div>
-            <div className="rule-node-list" hidden={closed}>
-              {items.map((node) => (
+            <div className="rule-node-list" hidden={closed || visibleItems.length === 0}>
+              {visibleItems.map((node) => (
                 <RuleNode key={node.signature} node={node}
                   open={expandedItems.has(node.signature)}
                   onToggle={() => setExpandedItems((previous) => {
@@ -143,6 +181,7 @@ export default function RuleDiffTable({ nodes, policies, onPolicyChange, onSubse
           </section>
         );
       })}
+      {filtering && visibleNodes.size === 0 && <div className="empty-state">No rule items match the current filter.</div>}
     </div>
   );
 }

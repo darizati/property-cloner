@@ -47,6 +47,65 @@ class _Log:
         return "\n".join(self.lines)
 
 
+def _schema_error_details(payload: object, rule_tree: dict) -> list[str]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("errors"), list):
+        return []
+
+    details = []
+    for error in payload["errors"]:
+        if not isinstance(error, dict):
+            continue
+        location, schema_location = error.get("location"), error.get("schemaLocation")
+        allowed = error.get("allowedValues")
+        if not isinstance(location, str) or not location.startswith("/") or not isinstance(schema_location, str):
+            continue
+        if not isinstance(allowed, list) or not allowed or "foundValue" not in error:
+            continue
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in location[1:].split("/")]
+        feature_index = next(
+            (i for i, part in enumerate(parts) if part in ("behaviors", "criteria") and i + 1 < len(parts)),
+            None,
+        )
+        if feature_index is None or "options" not in parts[feature_index + 2:]:
+            continue
+        node = rule_tree
+        try:
+            for part in parts[:feature_index + 2]:
+                node = node[int(part)] if isinstance(node, list) else node[part]
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+            continue
+        feature_name = node["name"]
+        encoded_name = feature_name.replace("~", "~0").replace("/", "~1")
+        if not schema_location.startswith(f"/definitions/catalog/{parts[feature_index]}/{encoded_name}/"):
+            continue
+
+        found = error["foundValue"]
+        if any(type(value) is type(found) and value == found for value in allowed):
+            continue
+        found_type = (
+            "boolean" if isinstance(found, bool) else
+            "string" if isinstance(found, str) else
+            "number" if isinstance(found, (int, float)) else
+            "null" if found is None else type(found).__name__
+        )
+        found_description = found_type
+        if isinstance(found, str) and found in ("true", "false"):
+            found_description += f" {json.dumps(found)}"
+        if all(isinstance(value, bool) for value in allowed):
+            expected = "boolean " + json.dumps(allowed)
+        else:
+            expected = "one of " + json.dumps(allowed)
+        message = (
+            f"{feature_name}.{parts[-1]}: received {found_description}; expected {expected}. "
+            f"Location: {location}"
+        )
+        if message not in details:
+            details.append(message)
+    return details
+
+
 def execute_job(job_id: int) -> None:
     db = SessionLocal()
     try:
@@ -60,7 +119,7 @@ def execute_job(job_id: int) -> None:
     except Exception as e:  # noqa: BLE001 - top-level job guard, must not crash the worker
         job = db.get(models.CloneJob, job_id)
         if job:
-            error_text = f"{e}\n{traceback.format_exc()}"
+            error_text = str(e) if isinstance(e, PapiError) else f"{e}\n{traceback.format_exc()}"
             job.status = models.JobStatus.FAILED
             job.error_summary = str(e)
             job.log = "\n".join(filter(None, [job.log, "[ERROR] " + error_text]))
@@ -154,7 +213,8 @@ def rerun_scheduled(profile_id: int) -> None:
         if job is not None:
             job.status = models.JobStatus.FAILED
             job.error_summary = str(e)
-            job.log = "\n".join(filter(None, [job.log, f"[ERROR] {e}\n{traceback.format_exc()}"]))
+            error_text = str(e) if isinstance(e, PapiError) else f"{e}\n{traceback.format_exc()}"
+            job.log = "\n".join(filter(None, [job.log, "[ERROR] " + error_text]))
             job.finished_at = datetime.datetime.utcnow()
             db.commit()
             notify_job_outcome(profile.name, job)
@@ -311,10 +371,27 @@ def _run_clone(db: Session, job: models.CloneJob, profile: models.CloneProfile) 
         f"?{urlencode(portal_params)}"
     )
     log(f"Uploading rule tree to version {target_version}")
-    upload_response = sqa_client.upload_rule_tree(
-        sqa_property_id, target_version, profile.sqa_contract_id, sqa_group_id,
-        sqa_switch_key, merged,
-    )
+    try:
+        upload_response = sqa_client.upload_rule_tree(
+            sqa_property_id, target_version, profile.sqa_contract_id, sqa_group_id,
+            sqa_switch_key, merged,
+        )
+    except PapiError as error:
+        schema_details = _schema_error_details(error.payload, merged)
+        if schema_details:
+            papi_message = error.payload.get("detail", "PAPI rejected the rule tree")
+            failure = (
+                f"PAPI HTTP {error.status_code}: {papi_message}\n"
+                + "\n".join(schema_details)
+                + "\nChoose a compatible SQA value or set a fixed override with the expected type."
+            )
+        else:
+            failure = str(error)
+        raise PapiError(
+            f"Rule tree upload failed. SQA version {target_version} may be incomplete; "
+            f"review the property before retrying.\n{failure}",
+            status_code=error.status_code, payload=error.payload,
+        ) from error
     try:
         validation = upload_response.json() if upload_response.content else {}
     except (ValueError, AttributeError):
